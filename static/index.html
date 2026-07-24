@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Page Pulse — URL Health Auditor</title>
+<style>
+  :root {
+    --bg: #12161f;
+    --bg-panel: #181d29;
+    --bg-inset: #0d1017;
+    --line: #2a3242;
+    --line-soft: #1f2530;
+    --text: #e7ebf3;
+    --text-dim: #8b94a8;
+    --amber: #f5a94e;
+    --mint: #6ee7c8;
+    --red: #f2685a;
+    --mono: "IBM Plex Mono", "SF Mono", Menlo, Consolas, monospace;
+    --sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    background-image:
+      radial-gradient(circle at 15% 0%, rgba(245,169,78,0.06), transparent 40%),
+      repeating-linear-gradient(0deg, rgba(255,255,255,0.012) 0px, rgba(255,255,255,0.012) 1px, transparent 1px, transparent 3px);
+    color: var(--text);
+    font-family: var(--sans);
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 48px 20px 80px;
+  }
+
+  .wrap { width: 100%; max-width: 720px; }
+
+  header { margin-bottom: 32px; }
+
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 12px;
+    letter-spacing: 0.12em;
+    color: var(--amber);
+    text-transform: uppercase;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 10px;
+  }
+  .eyebrow .dot {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--mint);
+    box-shadow: 0 0 6px var(--mint);
+  }
+
+  h1 {
+    font-family: var(--sans);
+    font-weight: 700;
+    font-size: 34px;
+    letter-spacing: -0.02em;
+    margin: 0 0 8px;
+  }
+  h1 span { color: var(--amber); }
+
+  .sub {
+    color: var(--text-dim);
+    font-size: 15px;
+    line-height: 1.5;
+    max-width: 54ch;
+  }
+
+  .console {
+    background: var(--bg-panel);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 20px;
+    margin: 28px 0 20px;
+  }
+
+  .prompt-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    background: var(--bg-inset);
+    border: 1px solid var(--line-soft);
+    border-radius: 7px;
+    padding: 12px 14px;
+  }
+  .prompt-glyph {
+    font-family: var(--mono);
+    color: var(--amber);
+    font-size: 15px;
+    user-select: none;
+  }
+  #url-input {
+    flex: 1;
+    background: transparent;
+    border: none;
+    outline: none;
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 14.5px;
+    min-width: 0;
+  }
+  #url-input::placeholder { color: #545e70; }
+
+  #scan-btn {
+    font-family: var(--mono);
+    font-size: 13px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    background: var(--amber);
+    color: #221604;
+    border: none;
+    border-radius: 6px;
+    padding: 9px 16px;
+    cursor: pointer;
+    font-weight: 600;
+    transition: transform 0.08s ease, filter 0.15s ease;
+    white-space: nowrap;
+  }
+  #scan-btn:hover { filter: brightness(1.08); }
+  #scan-btn:active { transform: scale(0.97); }
+  #scan-btn:disabled { opacity: 0.5; cursor: default; }
+  #scan-btn:focus-visible, #url-input:focus-visible { outline: 2px solid var(--mint); outline-offset: 2px; }
+
+  .pulse-track {
+    margin-top: 16px;
+    height: 46px;
+    position: relative;
+    overflow: hidden;
+    border-radius: 6px;
+    background: var(--bg-inset);
+    border: 1px solid var(--line-soft);
+  }
+  .pulse-track svg { width: 100%; height: 100%; display: block; }
+  .pulse-line {
+    fill: none;
+    stroke: var(--line);
+    stroke-width: 1.5;
+  }
+  .pulse-line.live {
+    stroke: var(--mint);
+    stroke-dasharray: 340;
+    stroke-dashoffset: 340;
+    animation: draw 1.1s ease-in-out infinite;
+    filter: drop-shadow(0 0 4px rgba(110,231,200,0.6));
+  }
+  .pulse-line.ok { stroke: var(--mint); }
+  .pulse-line.err { stroke: var(--red); }
+  @keyframes draw {
+    0% { stroke-dashoffset: 340; }
+    50% { stroke-dashoffset: 0; }
+    100% { stroke-dashoffset: -340; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .pulse-line.live { animation: none; stroke-dashoffset: 0; }
+  }
+
+  .status-line {
+    margin-top: 10px;
+    font-family: var(--mono);
+    font-size: 12.5px;
+    color: var(--text-dim);
+    min-height: 16px;
+  }
+  .status-line.err { color: var(--red); }
+
+  #report { display: none; }
+  #report.visible { display: block; }
+
+  .vitals {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 1px;
+    background: var(--line);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    overflow: hidden;
+    margin-bottom: 16px;
+  }
+  .vital {
+    background: var(--bg-panel);
+    padding: 16px;
+  }
+  .vital .label {
+    font-family: var(--mono);
+    font-size: 10.5px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    margin-bottom: 6px;
+  }
+  .vital .value {
+    font-family: var(--mono);
+    font-size: 22px;
+    font-weight: 600;
+  }
+  .vital .value.good { color: var(--mint); }
+  .vital .value.warn { color: var(--amber); }
+  .vital .value.bad { color: var(--red); }
+
+  .detail-card {
+    background: var(--bg-panel);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 18px 20px;
+    margin-bottom: 14px;
+  }
+  .detail-card h3 {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    margin: 0 0 10px;
+  }
+  .detail-card p {
+    margin: 0;
+    font-size: 14.5px;
+    line-height: 1.5;
+    color: var(--text);
+    word-break: break-word;
+  }
+  .detail-card p.muted { color: var(--text-dim); font-style: italic; }
+
+  footer {
+    margin-top: 40px;
+    text-align: center;
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--text-dim);
+  }
+  footer a { color: var(--amber); text-decoration: none; }
+  footer a:hover { text-decoration: underline; }
+
+  @media (max-width: 480px) {
+    h1 { font-size: 27px; }
+    .prompt-row { flex-wrap: wrap; }
+    #scan-btn { width: 100%; }
+  }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div class="eyebrow"><span class="dot"></span>Diagnostic scanner</div>
+      <h1>Page <span>Pulse</span></h1>
+      <p class="sub">Point it at any URL. It fetches the page and reads its vitals — status, speed, structure, and the accessibility gaps you'd otherwise miss.</p>
+    </header>
+
+    <div class="console">
+      <div class="prompt-row">
+        <span class="prompt-glyph">›</span>
+        <input id="url-input" type="text" placeholder="https://example.com" autocomplete="off" spellcheck="false" />
+        <button id="scan-btn">Scan</button>
+      </div>
+      <div class="pulse-track">
+        <svg viewBox="0 0 340 46" preserveAspectRatio="none">
+          <polyline id="pulse-poly" class="pulse-line"
+            points="0,23 40,23 55,23 65,6 75,40 85,23 100,23 150,23 165,23 175,6 185,40 195,23 210,23 260,23 275,23 285,6 295,40 305,23 340,23" />
+        </svg>
+      </div>
+      <div id="status-line" class="status-line">Idle — enter a URL to begin.</div>
+    </div>
+
+    <div id="report">
+      <div class="vitals" id="vitals-grid"></div>
+      <div class="detail-card">
+        <h3>Page title</h3>
+        <p id="detail-title"></p>
+      </div>
+      <div class="detail-card">
+        <h3>Meta description</h3>
+        <p id="detail-desc"></p>
+      </div>
+      <div class="detail-card">
+        <h3>Final URL reached</h3>
+        <p id="detail-url"></p>
+      </div>
+    </div>
+
+    <footer>
+      Built for Digital Heroes Training Task &middot; <a href="https://digitalheroesco.com" target="_blank" rel="noopener">digitalheroesco.com</a>
+    </footer>
+  </div>
+
+<script>
+const urlInput = document.getElementById('url-input');
+const scanBtn = document.getElementById('scan-btn');
+const statusLine = document.getElementById('status-line');
+const pulsePoly = document.getElementById('pulse-poly');
+const report = document.getElementById('report');
+const vitalsGrid = document.getElementById('vitals-grid');
+const detailTitle = document.getElementById('detail-title');
+const detailDesc = document.getElementById('detail-desc');
+const detailUrl = document.getElementById('detail-url');
+
+function setPulse(state) {
+  pulsePoly.classList.remove('live', 'ok', 'err');
+  if (state) pulsePoly.classList.add(state);
+}
+
+function vitalCard(label, value, tone) {
+  const div = document.createElement('div');
+  div.className = 'vital';
+  div.innerHTML = `<div class="label">${label}</div><div class="value ${tone || ''}">${value}</div>`;
+  return div;
+}
+
+function toneForStatus(status) {
+  if (status >= 200 && status < 300) return 'good';
+  if (status >= 300 && status < 400) return 'warn';
+  return 'bad';
+}
+
+async function runScan() {
+  const rawUrl = urlInput.value.trim();
+  if (!rawUrl) {
+    statusLine.textContent = 'Enter a URL first.';
+    statusLine.classList.add('err');
+    return;
+  }
+
+  const target = /^https?:\/\//i.test(rawUrl) ? rawUrl : `https://${rawUrl}`;
+
+  scanBtn.disabled = true;
+  statusLine.classList.remove('err');
+  statusLine.textContent = `Scanning ${target} …`;
+  setPulse('live');
+  report.classList.remove('visible');
+
+  try {
+    const res = await fetch('/api/audit', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: target }),
+    });
+    const data = await res.json();
+
+    if (!res.ok) {
+      setPulse('err');
+      statusLine.textContent = `${data.error_code} — ${data.message}`;
+      statusLine.classList.add('err');
+      return;
+    }
+
+    setPulse('ok');
+    statusLine.textContent = `Done in ${data.response_time_ms}ms — audited ${new Date(data.audited_at).toLocaleTimeString()}`;
+
+    vitalsGrid.innerHTML = '';
+    vitalsGrid.appendChild(vitalCard('HTTP status', data.http_status, toneForStatus(data.http_status)));
+    vitalsGrid.appendChild(vitalCard('Response time', `${data.response_time_ms}ms`, data.response_time_ms < 1000 ? 'good' : 'warn'));
+    vitalsGrid.appendChild(vitalCard('H1 tags', data.h1_count, data.h1_count === 1 ? 'good' : 'warn'));
+    vitalsGrid.appendChild(vitalCard('Images', data.image_count));
+    vitalsGrid.appendChild(vitalCard('Missing alt text', data.images_missing_alt, data.images_missing_alt > 0 ? 'bad' : 'good'));
+    vitalsGrid.appendChild(vitalCard('Word count', data.word_count));
+
+    detailTitle.textContent = data.title || '(none found)';
+    detailTitle.classList.toggle('muted', !data.title);
+    detailDesc.textContent = data.meta_description || '(none found)';
+    detailDesc.classList.toggle('muted', !data.meta_description);
+    detailUrl.textContent = data.url;
+
+    report.classList.add('visible');
+  } catch (err) {
+    setPulse('err');
+    statusLine.textContent = 'Network error reaching the audit API.';
+    statusLine.classList.add('err');
+  } finally {
+    scanBtn.disabled = false;
+  }
+}
+
+scanBtn.addEventListener('click', runScan);
+urlInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') runScan();
+});
+</script>
+</body>
+</html>
