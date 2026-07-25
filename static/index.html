@@ -353,6 +353,7 @@ function renderSingle(data){
   vgrid.appendChild(vc('Images',data.image_count,'',4));
   vgrid.appendChild(vc('Missing Alt',data.images_missing_alt,data.images_missing_alt>0?'bad':'good',5));
   vgrid.appendChild(vc('Words',data.word_count,'',6));
+  vgrid.appendChild(vc('Attempts',data.attempts||1,(!data.attempts||data.attempts===1)?'good':'warn',7));
   dTitle.className='dv fade-up fade-up-1'+(data.title?'':' muted');
   dTitle.textContent=data.title||'(none found)';
   dDesc.className='dv fade-up fade-up-2'+(data.meta_description?'':' muted');
