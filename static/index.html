@@ -413,11 +413,11 @@ async function runSingle(){
   try{
     const res=await fetch('/api/audit',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url})});
     const d=await res.json();
-    if(res.status===429){setPulse('err');setStatus('err','⏱ Rate limit reached — try again in a minute.');return;}
-    if(!res.ok){setPulse('err');setStatus('err',d.error_code+' — '+d.message);return;}
+    if(res.status===429){setPulse('err');setStatus('err','⏱ Rate limit reached — try again in a minute.');report.classList.remove('vis');return;}
+    if(!res.ok){setPulse('err');setStatus('err',d.error_code+' — '+d.message);report.classList.remove('vis');return;}
     setPulse('ok');setStatus('ok','Done in '+d.response_time_ms+'ms · '+new Date(d.audited_at).toLocaleTimeString());
     renderSingle(d);
-  }catch{setPulse('err');setStatus('err','Network error reaching the audit API.');}
+  }catch{setPulse('err');setStatus('err','Network error reaching the audit API.');report.classList.remove('vis');}
   finally{sbtnS.disabled=false;mainCard.classList.remove('scanning');}
 }
 
@@ -432,11 +432,11 @@ async function runBatch(){
   try{
     const res=await fetch('/api/audit/batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({urls})});
     const d=await res.json();
-    if(res.status===429){setPulse('err');setStatus('err','⏱ Rate limit reached — try again in a minute.');return;}
-    if(!res.ok){setPulse('err');setStatus('err',d.error_code+' — '+d.message);return;}
+    if(res.status===429){setPulse('err');setStatus('err','⏱ Rate limit reached — try again in a minute.');batchRpt.classList.remove('vis');return;}
+    if(!res.ok){setPulse('err');setStatus('err',d.error_code+' — '+d.message);batchRpt.classList.remove('vis');return;}
     setPulse('ok');setStatus('ok','Batch done · '+d.succeeded+'/'+d.total+' passed · '+new Date(d.audited_at).toLocaleTimeString());
     renderBatch(d);
-  }catch{setPulse('err');setStatus('err','Network error reaching the batch API.');}
+  }catch{setPulse('err');setStatus('err','Network error reaching the batch API.');batchRpt.classList.remove('vis');}
   finally{sbtnB.disabled=false;mainCard.classList.remove('scanning');}
 }
 
