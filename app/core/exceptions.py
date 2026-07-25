@@ -1,26 +1,3 @@
-"""
-Domain-specific exceptions for the audit pipeline.
-
-Design decision: rather than letting httpx/parsing exceptions bubble up as
-generic 500s, every failure mode we can anticipate gets its own exception
-class mapped to a specific HTTP status code in main.py's exception handlers.
-This keeps routers/services free of try/except-for-HTTP-codes noise —
-services just raise the semantically correct exception, and the transport
-layer (FastAPI) decides how to represent it over HTTP.
-
-Retry classification
---------------------
-Each AuditError subclass carries a `retryable` flag.
-
-  retryable = True  →  transient fault (connection reset, 503 overload, timeout).
-                        The same request might succeed moments later.
-
-  retryable = False →  permanent fault (404, malformed URL, wrong content-type).
-                        Retrying is pointless and wastes time/resources.
-
-The fetcher layer reads this flag so it never retries permanent failures,
-which is a key correctness distinction a senior engineer would enforce.
-"""
 
 
 class AuditError(Exception):
@@ -35,9 +12,8 @@ class AuditError(Exception):
         super().__init__(message)
 
 
-# ---------------------------------------------------------------------------
 # Transient failures — safe to retry
-# ---------------------------------------------------------------------------
+
 
 
 class UnreachableURLError(AuditError):
@@ -68,9 +44,7 @@ class TransientUpstreamError(AuditError):
         super().__init__(message)
 
 
-# ---------------------------------------------------------------------------
 # Permanent failures — never retry
-# ---------------------------------------------------------------------------
 
 
 class TooManyRedirectsError(AuditError):

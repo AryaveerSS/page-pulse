@@ -1,25 +1,3 @@
-"""
-Handles the network side of an audit: fetching a URL safely, with retry.
-
-Kept deliberately separate from parsing (see services/parser.py) so each can
-be tested independently — fetcher.py is the only module that touches the
-network, parser.py is pure functions over already-downloaded text.
-
-Retry strategy
---------------
-Not all errors are equal, and retrying blindly is a code smell:
-
-  • Transient errors (timeout, connection reset, 503) → retry up to
-    `settings.max_retry_attempts` times with a short backoff.  The same
-    request can plausibly succeed moments later.
-
-  • Permanent errors (404, malformed URL, wrong content-type) → raised
-    immediately with no retry.  Retrying a 404 just wastes time and masks
-    the real problem.
-
-The distinction is encoded on each AuditError subclass via `retryable`,
-so this module never needs to inspect HTTP status codes directly to decide.
-"""
 
 import asyncio
 import time
