@@ -1,22 +1,32 @@
 """
-Tests for the retry logic in app/services/fetcher.py.
+Tests for retry logic in app/services/fetcher.py.
 
-Core invariant being tested:
-  - Transient failures (timeout, connection error, 503) are retried.
-  - Permanent failures (404, 410, wrong content-type) are raised immediately
-    with exactly 1 attempt — never retried.
+The core invariant: not all errors are equal.
 
-The tests mock _attempt_fetch directly so they don't touch the network,
-and they patch settings.max_retry_attempts to keep execution fast
-(no real asyncio.sleep waits).
+  retryable=True  (transient) → fetch_page() retries up to max_retry_attempts.
+  retryable=False (permanent) → fetch_page() raises immediately, 1 attempt only.
+
+Every AuditError subclass carries this flag; the retry loop reads it rather
+than inspecting HTTP status codes directly.  These tests verify that contract
+from multiple angles:
+
+  1. Each transient error type triggers a retry that succeeds.
+  2. Exhausting all retries raises the last exception.
+  3. Each permanent error type is raised after exactly 1 attempt.
+  4. The `attempts` field on FetchResult accurately reflects what happened.
+  5. asyncio.sleep is called with the configured backoff (not just called once).
+  6. The retryable flag on each exception class matches the documented contract.
 """
 
-from unittest.mock import AsyncMock, patch
+import asyncio
+from unittest.mock import AsyncMock, patch, call
 
 import pytest
 
 from app.core.exceptions import (
+    ContentTooLargeError,
     FetchTimeoutError,
+    TooManyRedirectsError,
     TransientUpstreamError,
     UnreachableURLError,
     UpstreamHTTPError,
@@ -39,8 +49,8 @@ _GOOD_RESULT = FetchResult(
 
 def _make_attempt_mock(*side_effects):
     """
-    Return an AsyncMock for _attempt_fetch that raises/returns each item in
-    `side_effects` in order.  Exceptions are raised; non-exceptions returned.
+    Return an async callable for _attempt_fetch that yields each item in
+    `side_effects` in order — raising exceptions, returning non-exceptions.
     """
 
     async def _mock(url: str):
@@ -55,79 +65,136 @@ def _make_attempt_mock(*side_effects):
 
 
 # ---------------------------------------------------------------------------
-# Transient failure → retry → success
+# Exception class contracts — retryable flags
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-@patch("app.services.fetcher.asyncio.sleep", new_callable=AsyncMock)
-async def test_retries_on_timeout_then_succeeds(mock_sleep):
-    """A single timeout should trigger one retry that succeeds."""
-    attempt_mock = _make_attempt_mock(
-        FetchTimeoutError("timed out"),
-        _GOOD_RESULT,
-    )
+class TestRetryableFlags:
+    """The retryable flag on each exception class is the source of truth.
+    These tests make that contract explicit and machine-verifiable."""
 
-    with patch("app.services.fetcher._attempt_fetch", side_effect=attempt_mock):
-        result = await fetch_page("https://example.com/")
+    def test_fetch_timeout_is_retryable(self):
+        assert FetchTimeoutError.retryable is True
 
-    assert result.http_status == 200
-    assert attempt_mock.call_count == 2
-    mock_sleep.assert_awaited_once()
+    def test_unreachable_url_is_retryable(self):
+        assert UnreachableURLError.retryable is True
 
+    def test_transient_upstream_error_is_retryable(self):
+        assert TransientUpstreamError.retryable is True
 
-@pytest.mark.asyncio
-@patch("app.services.fetcher.asyncio.sleep", new_callable=AsyncMock)
-async def test_retries_on_connection_error_then_succeeds(mock_sleep):
-    """A connection error (transient) should trigger a retry."""
-    attempt_mock = _make_attempt_mock(
-        UnreachableURLError("conn reset"),
-        _GOOD_RESULT,
-    )
+    def test_upstream_http_error_is_not_retryable(self):
+        assert UpstreamHTTPError.retryable is False
 
-    with patch("app.services.fetcher._attempt_fetch", side_effect=attempt_mock):
-        result = await fetch_page("https://example.com/")
+    def test_unsupported_content_type_is_not_retryable(self):
+        assert UnsupportedContentTypeError.retryable is False
 
-    assert result.http_status == 200
-    assert attempt_mock.call_count == 2
-    mock_sleep.assert_awaited_once()
+    def test_content_too_large_is_not_retryable(self):
+        assert ContentTooLargeError.retryable is False
 
-
-@pytest.mark.asyncio
-@patch("app.services.fetcher.asyncio.sleep", new_callable=AsyncMock)
-async def test_retries_on_503_then_succeeds(mock_sleep):
-    """A 503 (TransientUpstreamError) should be retried."""
-    attempt_mock = _make_attempt_mock(
-        TransientUpstreamError("503 overloaded", upstream_status=503),
-        _GOOD_RESULT,
-    )
-
-    with patch("app.services.fetcher._attempt_fetch", side_effect=attempt_mock):
-        result = await fetch_page("https://example.com/")
-
-    assert result.http_status == 200
-    assert attempt_mock.call_count == 2
+    def test_too_many_redirects_is_not_retryable(self):
+        assert TooManyRedirectsError.retryable is False
 
 
 # ---------------------------------------------------------------------------
-# Transient failure — exhausts all retries
+# Transient failures → retry → success
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-@patch("app.services.fetcher.asyncio.sleep", new_callable=AsyncMock)
-async def test_raises_after_exhausting_retries(mock_sleep):
-    """If every attempt fails transiently, the last exception is raised."""
-    attempt_mock = _make_attempt_mock(
-        FetchTimeoutError("timeout #1"),
-        FetchTimeoutError("timeout #2"),
-    )
+class TestTransientRetry:
+    @pytest.mark.asyncio
+    @patch("app.services.fetcher.asyncio.sleep", new_callable=AsyncMock)
+    async def test_retries_on_timeout(self, mock_sleep):
+        mock = _make_attempt_mock(FetchTimeoutError("timed out"), _GOOD_RESULT)
+        with patch("app.services.fetcher._attempt_fetch", side_effect=mock):
+            result = await fetch_page("https://example.com/")
+        assert result.http_status == 200
+        assert mock.call_count == 2
+        mock_sleep.assert_awaited_once()
 
-    with patch("app.services.fetcher._attempt_fetch", side_effect=attempt_mock):
-        with pytest.raises(FetchTimeoutError):
-            await fetch_page("https://slow.example.com/")
+    @pytest.mark.asyncio
+    @patch("app.services.fetcher.asyncio.sleep", new_callable=AsyncMock)
+    async def test_retries_on_connection_error(self, mock_sleep):
+        mock = _make_attempt_mock(UnreachableURLError("conn reset"), _GOOD_RESULT)
+        with patch("app.services.fetcher._attempt_fetch", side_effect=mock):
+            result = await fetch_page("https://example.com/")
+        assert result.http_status == 200
+        assert mock.call_count == 2
 
-    assert attempt_mock.call_count == 2  # used all retries
+    @pytest.mark.asyncio
+    @patch("app.services.fetcher.asyncio.sleep", new_callable=AsyncMock)
+    async def test_retries_on_503(self, mock_sleep):
+        mock = _make_attempt_mock(
+            TransientUpstreamError("503 overloaded", upstream_status=503),
+            _GOOD_RESULT,
+        )
+        with patch("app.services.fetcher._attempt_fetch", side_effect=mock):
+            result = await fetch_page("https://example.com/")
+        assert result.http_status == 200
+        assert mock.call_count == 2
+
+    @pytest.mark.asyncio
+    @patch("app.services.fetcher.asyncio.sleep", new_callable=AsyncMock)
+    async def test_attempts_field_reflects_retry_count(self, mock_sleep):
+        """After one retry, attempts must equal 2."""
+        mock = _make_attempt_mock(FetchTimeoutError("slow"), _GOOD_RESULT)
+        with patch("app.services.fetcher._attempt_fetch", side_effect=mock):
+            result = await fetch_page("https://example.com/")
+        assert result.attempts == 2
+
+    @pytest.mark.asyncio
+    @patch("app.services.fetcher.asyncio.sleep", new_callable=AsyncMock)
+    async def test_backoff_called_with_configured_delay(self, mock_sleep):
+        """asyncio.sleep must be called with retry_backoff_seconds, not an arbitrary value."""
+        from app.core.config import settings
+
+        mock = _make_attempt_mock(FetchTimeoutError("slow"), _GOOD_RESULT)
+        with patch("app.services.fetcher._attempt_fetch", side_effect=mock):
+            await fetch_page("https://example.com/")
+        mock_sleep.assert_awaited_once_with(settings.retry_backoff_seconds)
+
+
+# ---------------------------------------------------------------------------
+# Exhausting retries
+# ---------------------------------------------------------------------------
+
+
+class TestRetryExhaustion:
+    @pytest.mark.asyncio
+    @patch("app.services.fetcher.asyncio.sleep", new_callable=AsyncMock)
+    async def test_raises_after_all_attempts_fail(self, mock_sleep):
+        mock = _make_attempt_mock(
+            FetchTimeoutError("timeout #1"),
+            FetchTimeoutError("timeout #2"),
+        )
+        with patch("app.services.fetcher._attempt_fetch", side_effect=mock):
+            with pytest.raises(FetchTimeoutError):
+                await fetch_page("https://slow.example.com/")
+        assert mock.call_count == 2
+
+    @pytest.mark.asyncio
+    @patch("app.services.fetcher.asyncio.sleep", new_callable=AsyncMock)
+    async def test_raises_last_exception_not_first(self, mock_sleep):
+        """The exception raised after exhaustion should be the last one."""
+        first = FetchTimeoutError("first timeout")
+        second = FetchTimeoutError("second timeout — this is the one that propagates")
+        mock = _make_attempt_mock(first, second)
+        with patch("app.services.fetcher._attempt_fetch", side_effect=mock):
+            with pytest.raises(FetchTimeoutError) as exc_info:
+                await fetch_page("https://slow.example.com/")
+        assert "second" in exc_info.value.message
+
+    @pytest.mark.asyncio
+    @patch("app.services.fetcher.asyncio.sleep", new_callable=AsyncMock)
+    async def test_sleep_called_once_for_single_retry(self, mock_sleep):
+        """With max_retry_attempts=2 (1 retry), sleep must be called exactly once."""
+        mock = _make_attempt_mock(
+            FetchTimeoutError("timeout"),
+            FetchTimeoutError("timeout again"),
+        )
+        with patch("app.services.fetcher._attempt_fetch", side_effect=mock):
+            with pytest.raises(FetchTimeoutError):
+                await fetch_page("https://slow.example.com/")
+        assert mock_sleep.await_count == 1
 
 
 # ---------------------------------------------------------------------------
@@ -135,64 +202,95 @@ async def test_raises_after_exhausting_retries(mock_sleep):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_404_is_not_retried():
-    """A 404 (UpstreamHTTPError, retryable=False) must never be retried."""
-    attempt_mock = _make_attempt_mock(
-        UpstreamHTTPError("404 not found", upstream_status=404),
-    )
+class TestPermanentFailures:
+    @pytest.mark.asyncio
+    async def test_404_raises_immediately(self):
+        mock = _make_attempt_mock(UpstreamHTTPError("404", upstream_status=404))
+        with patch("app.services.fetcher._attempt_fetch", side_effect=mock):
+            with pytest.raises(UpstreamHTTPError):
+                await fetch_page("https://example.com/missing")
+        assert mock.call_count == 1
 
-    with patch("app.services.fetcher._attempt_fetch", side_effect=attempt_mock):
-        with pytest.raises(UpstreamHTTPError):
-            await fetch_page("https://example.com/missing")
+    @pytest.mark.asyncio
+    async def test_403_raises_immediately(self):
+        mock = _make_attempt_mock(UpstreamHTTPError("403", upstream_status=403))
+        with patch("app.services.fetcher._attempt_fetch", side_effect=mock):
+            with pytest.raises(UpstreamHTTPError):
+                await fetch_page("https://example.com/forbidden")
+        assert mock.call_count == 1
 
-    # Exactly one attempt — retry loop must bail immediately.
-    assert attempt_mock.call_count == 1
+    @pytest.mark.asyncio
+    async def test_410_raises_immediately(self):
+        mock = _make_attempt_mock(UpstreamHTTPError("410 gone", upstream_status=410))
+        with patch("app.services.fetcher._attempt_fetch", side_effect=mock):
+            with pytest.raises(UpstreamHTTPError):
+                await fetch_page("https://example.com/gone")
+        assert mock.call_count == 1
 
+    @pytest.mark.asyncio
+    async def test_wrong_content_type_raises_immediately(self):
+        mock = _make_attempt_mock(UnsupportedContentTypeError("application/json"))
+        with patch("app.services.fetcher._attempt_fetch", side_effect=mock):
+            with pytest.raises(UnsupportedContentTypeError):
+                await fetch_page("https://api.example.com/data.json")
+        assert mock.call_count == 1
 
-@pytest.mark.asyncio
-async def test_wrong_content_type_is_not_retried():
-    """UnsupportedContentTypeError (retryable=False) is raised immediately."""
-    attempt_mock = _make_attempt_mock(
-        UnsupportedContentTypeError("got application/json"),
-    )
+    @pytest.mark.asyncio
+    async def test_too_many_redirects_raises_immediately(self):
+        mock = _make_attempt_mock(TooManyRedirectsError("redirect loop"))
+        with patch("app.services.fetcher._attempt_fetch", side_effect=mock):
+            with pytest.raises(TooManyRedirectsError):
+                await fetch_page("https://looping.example.com/")
+        assert mock.call_count == 1
 
-    with patch("app.services.fetcher._attempt_fetch", side_effect=attempt_mock):
-        with pytest.raises(UnsupportedContentTypeError):
-            await fetch_page("https://api.example.com/data.json")
+    @pytest.mark.asyncio
+    async def test_content_too_large_raises_immediately(self):
+        mock = _make_attempt_mock(ContentTooLargeError("exceeded 5MB"))
+        with patch("app.services.fetcher._attempt_fetch", side_effect=mock):
+            with pytest.raises(ContentTooLargeError):
+                await fetch_page("https://huge.example.com/")
+        assert mock.call_count == 1
 
-    assert attempt_mock.call_count == 1
-
-
-@pytest.mark.asyncio
-async def test_410_gone_is_not_retried():
-    """HTTP 410 Gone is a permanent client error and must never be retried."""
-    attempt_mock = _make_attempt_mock(
-        UpstreamHTTPError("410 gone", upstream_status=410),
-    )
-
-    with patch("app.services.fetcher._attempt_fetch", side_effect=attempt_mock):
-        with pytest.raises(UpstreamHTTPError):
-            await fetch_page("https://example.com/gone")
-
-    assert attempt_mock.call_count == 1
+    @pytest.mark.asyncio
+    async def test_permanent_failure_never_calls_sleep(self):
+        mock = _make_attempt_mock(UpstreamHTTPError("404", upstream_status=404))
+        with patch("app.services.fetcher._attempt_fetch", side_effect=mock):
+            with patch(
+                "app.services.fetcher.asyncio.sleep", new_callable=AsyncMock
+            ) as mock_sleep:
+                with pytest.raises(UpstreamHTTPError):
+                    await fetch_page("https://example.com/missing")
+        mock_sleep.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
-# Happy path — no retry needed
+# Clean success — no retry needed
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_success_on_first_attempt_sets_attempts_to_1():
-    """A clean success should report attempts=1 and never call sleep."""
-    attempt_mock = _make_attempt_mock(_GOOD_RESULT)
-
-    with patch("app.services.fetcher._attempt_fetch", side_effect=attempt_mock):
-        with patch(
-            "app.services.fetcher.asyncio.sleep", new_callable=AsyncMock
-        ) as mock_sleep:
+class TestCleanSuccess:
+    @pytest.mark.asyncio
+    async def test_attempts_is_1_on_first_success(self):
+        mock = _make_attempt_mock(_GOOD_RESULT)
+        with patch("app.services.fetcher._attempt_fetch", side_effect=mock):
             result = await fetch_page("https://example.com/")
+        assert result.attempts == 1
 
-    assert result.attempts == 1
-    mock_sleep.assert_not_awaited()
+    @pytest.mark.asyncio
+    async def test_no_sleep_on_first_success(self):
+        mock = _make_attempt_mock(_GOOD_RESULT)
+        with patch("app.services.fetcher._attempt_fetch", side_effect=mock):
+            with patch(
+                "app.services.fetcher.asyncio.sleep", new_callable=AsyncMock
+            ) as mock_sleep:
+                await fetch_page("https://example.com/")
+        mock_sleep.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_result_fields_pass_through_unchanged(self):
+        mock = _make_attempt_mock(_GOOD_RESULT)
+        with patch("app.services.fetcher._attempt_fetch", side_effect=mock):
+            result = await fetch_page("https://example.com/")
+        assert result.final_url == "https://example.com/"
+        assert result.http_status == 200
+        assert result.html == "<html><body>ok</body></html>"
